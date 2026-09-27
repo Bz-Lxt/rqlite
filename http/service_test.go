@@ -20,6 +20,7 @@ import (
 
 	cluster "github.com/rqlite/rqlite/v10/cluster/proto"
 	command "github.com/rqlite/rqlite/v10/command/proto"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/proxy"
 	"github.com/rqlite/rqlite/v10/store"
 )
@@ -2863,4 +2864,394 @@ func newSQLAnalyzeHost(t *testing.T) string {
 	}
 	t.Cleanup(func() { s.Close() })
 	return fmt.Sprintf("http://%s", s.Addr().String())
+}
+
+// testClassifier is a Classifier driven by a function.
+type testClassifier func(stmts []*command.Statement) limit.Class
+
+func (f testClassifier) Class(stmts []*command.Statement) limit.Class { return f(stmts) }
+
+// newAdmissionService starts an HTTP service gated by the given limiter
+// configuration.
+func newAdmissionService(t *testing.T, cfg limit.Config) (*Service, *MockStore, *mockClusterService, *limit.Limiter) {
+	t.Helper()
+	limit.ResetStats()
+	m := &MockStore{}
+	c := &mockClusterService{}
+	l := limit.New(cfg)
+	s := New("127.0.0.1:0", m, c, proxy.New(m, c), nil)
+	s.Limiter = l
+	if err := s.Start(); err != nil {
+		t.Fatalf("failed to start service: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s, m, c, l
+}
+
+func jsonPost(ctx context.Context, host, path string, body string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "POST", host+path, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return (&http.Client{}).Do(req)
+}
+
+const writeBody = `["INSERT INTO foo VALUES(1)"]`
+const readBody = `["SELECT * FROM foo"]`
+
+// Test_HTTPExecuteOverloadReject: a saturated write pool with zero
+// queue rejects immediately with 503.
+func Test_HTTPExecuteOverloadReject(t *testing.T) {
+	s, m, _, _ := newAdmissionService(t, limit.Config{WriteConcurrency: 1})
+
+	started, hold := make(chan struct{}), make(chan struct{})
+	m.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		close(started)
+		<-hold
+		return nil, 1, nil
+	}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	r1Done := make(chan struct{})
+	go func() {
+		defer close(r1Done)
+		resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+		if err != nil {
+			t.Errorf("request 1: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+	<-started
+
+	start := time.Now()
+	resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+	if err != nil {
+		t.Fatalf("request 2: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("overload status: got %d want 503", resp.StatusCode)
+	}
+	if time.Since(start) > 100*time.Millisecond {
+		t.Fatalf("overload rejection not immediate: %s", time.Since(start))
+	}
+
+	close(hold)
+	<-r1Done
+}
+
+// Test_HTTPExecuteQueuedThenSucceeds: a one-deep queue parks the
+// second request, which proceeds once the first releases its slot.
+func Test_HTTPExecuteQueuedThenSucceeds(t *testing.T) {
+	s, m, _, _ := newAdmissionService(t, limit.Config{WriteConcurrency: 1, WriteQueue: 1})
+
+	started, hold := make(chan struct{}), make(chan struct{})
+	m.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-hold
+		return nil, 1, nil
+	}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	r1Done := make(chan struct{})
+	go func() {
+		defer close(r1Done)
+		resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+		if err != nil {
+			t.Errorf("request 1: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+	<-started
+
+	r2Done := make(chan int, 1)
+	go func() {
+		resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+		if err != nil {
+			t.Errorf("request 2: %v", err)
+			r2Done <- -1
+			return
+		}
+		defer resp.Body.Close()
+		r2Done <- resp.StatusCode
+	}()
+	// Request 2 must be parked, not rejected and not completed.
+	select {
+	case code := <-r2Done:
+		t.Fatalf("request 2 returned early with %d", code)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(hold)
+	<-r1Done
+	if code := <-r2Done; code != http.StatusOK {
+		t.Fatalf("queued request after release: got %d want 200", code)
+	}
+}
+
+// Test_HTTPRequestClassification: unified requests occupy the read or
+// write pool according to the classifier; the two pools stay
+// independent.
+func Test_HTTPRequestClassification(t *testing.T) {
+	s, m, _, _ := newAdmissionService(t, limit.Config{
+		WriteConcurrency: 1, ReadConcurrency: 1,
+	})
+	s.Classifier = testClassifier(func(stmts []*command.Statement) limit.Class {
+		for _, st := range stmts {
+			if !strings.HasPrefix(strings.ToUpper(st.Sql), "SELECT") {
+				return limit.Write
+			}
+		}
+		return limit.Read
+	})
+
+	readStarted, readHold := make(chan struct{}), make(chan struct{})
+	m.queryFn = func(qr *command.QueryRequest) ([]*command.QueryRows, uint64, error) {
+		close(readStarted)
+		<-readHold
+		return nil, 1, nil
+	}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	blockedRead := make(chan struct{})
+	go func() {
+		defer close(blockedRead)
+		resp, err := jsonPost(context.Background(), host, "/db/query", readBody)
+		if err != nil {
+			t.Errorf("blocking read: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+	<-readStarted
+
+	// Read pool saturated: pure-read unified request rejected, mixed
+	// request still succeeds via the write pool.
+	resp, err := jsonPost(context.Background(), host, "/db/request", readBody)
+	if err != nil {
+		t.Fatalf("pure-read request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("pure-read with read full: got %d want 503", resp.StatusCode)
+	}
+	resp, err = jsonPost(context.Background(), host, "/db/request", writeBody)
+	if err != nil {
+		t.Fatalf("mixed request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mixed request with read full: got %d want 200", resp.StatusCode)
+	}
+
+	close(readHold)
+	<-blockedRead
+}
+
+// Test_HTTPRequestNoClassifierDefaultWrite: without a classifier a
+// unified request is treated as a write even when all statements look
+// like reads.
+func Test_HTTPRequestNoClassifierDefaultWrite(t *testing.T) {
+	s, m, _, _ := newAdmissionService(t, limit.Config{
+		WriteConcurrency: 1, ReadConcurrency: 1,
+	})
+
+	started, hold := make(chan struct{}), make(chan struct{})
+	m.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		close(started)
+		<-hold
+		return nil, 1, nil
+	}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	blocked := make(chan struct{})
+	go func() {
+		defer close(blocked)
+		resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+		if err != nil {
+			t.Errorf("blocking execute: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+	<-started
+
+	resp, err := jsonPost(context.Background(), host, "/db/request", readBody)
+	if err != nil {
+		t.Fatalf("request without classifier: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("request without classifier should use write pool: got %d want 503", resp.StatusCode)
+	}
+
+	close(hold)
+	<-blocked
+}
+
+// Test_HTTPQueueCancel: a canceled queued request returns promptly,
+// is never promoted, and the next waiter takes its place.
+func Test_HTTPQueueCancel(t *testing.T) {
+	s, m, _, _ := newAdmissionService(t, limit.Config{WriteConcurrency: 1, WriteQueue: 1})
+
+	started, hold := make(chan struct{}), make(chan struct{})
+	m.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-hold
+		return nil, 1, nil
+	}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	r1Done := make(chan struct{})
+	go func() {
+		defer close(r1Done)
+		resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+		if err != nil {
+			t.Errorf("request 1: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+	<-started
+
+	// Request 2 parks with a cancelable context, then is canceled.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	canceledErr := make(chan error, 1)
+	go func() {
+		_, err := jsonPost(ctx2, host, "/db/execute", writeBody)
+		canceledErr <- err
+	}()
+	time.Sleep(100 * time.Millisecond) // Let request 2 park.
+	cancel2()
+	if err := <-canceledErr; err == nil {
+		t.Fatalf("expected client error after cancel")
+	}
+
+	// Request 3 takes the vacated queue slot.
+	r3Done := make(chan int, 1)
+	go func() {
+		resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+		if err != nil {
+			t.Errorf("request 3: %v", err)
+			r3Done <- -1
+			return
+		}
+		defer resp.Body.Close()
+		r3Done <- resp.StatusCode
+	}()
+	time.Sleep(100 * time.Millisecond) // Let request 3 park.
+
+	close(hold)
+	<-r1Done
+	if code := <-r3Done; code != http.StatusOK {
+		t.Fatalf("request 3 promoted after cancel: got %d want 200", code)
+	}
+}
+
+// Test_HTTPEntryHoldsSlotDuringForward: the entry node keeps its slot
+// for the whole forwarded wait, so forwarding resources are bounded.
+func Test_HTTPEntryHoldsSlotDuringForward(t *testing.T) {
+	s, m, c, l := newAdmissionService(t, limit.Config{WriteConcurrency: 1})
+	m.leaderAddr = "leader:1234"
+
+	m.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		return nil, 0, store.ErrNotLeader
+	}
+	fwdStarted, fwdHold := make(chan struct{}), make(chan struct{})
+	c.executeFn = func(er *command.ExecuteRequest, addr string, t time.Duration) ([]*command.ExecuteQueryResponse, uint64, error) {
+		close(fwdStarted)
+		<-fwdHold
+		return nil, 2, nil
+	}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	r1Done := make(chan struct{})
+	go func() {
+		defer close(r1Done)
+		resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+		if err != nil {
+			t.Errorf("forwarded request: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+	}()
+	<-fwdStarted
+
+	ws := l.Stats()["write"].(map[string]any)
+	if ws["in_flight"] != 1 {
+		t.Fatalf("entry slot not held during forward: %v", ws)
+	}
+
+	resp, err := jsonPost(context.Background(), host, "/db/execute", writeBody)
+	if err != nil {
+		t.Fatalf("request during forward: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("overload during forward: got %d want 503", resp.StatusCode)
+	}
+
+	close(fwdHold)
+	<-r1Done
+}
+
+// Test_HTTPForwardedOverloadMaps503 (TR-I-2.2): when the executing
+// node sheds a forwarded request, the entry node returns 503 for
+// execute, query and request rather than a 200 carrying an error body.
+func Test_HTTPForwardedOverloadMaps503(t *testing.T) {
+	s, m, c, _ := newAdmissionService(t, limit.Config{})
+	m.leaderAddr = "leader:1234"
+
+	m.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		return nil, 0, store.ErrNotLeader
+	}
+	m.queryFn = func(qr *command.QueryRequest) ([]*command.QueryRows, uint64, error) {
+		return nil, 0, store.ErrNotLeader
+	}
+	m.requestFn = func(eqr *command.ExecuteQueryRequest) ([]*command.ExecuteQueryResponse, uint64, uint64, error) {
+		return nil, 0, 0, store.ErrNotLeader
+	}
+	overloadErr := fmt.Errorf("%w", limit.ErrOverloaded)
+	c.executeFn = func(er *command.ExecuteRequest, addr string, t time.Duration) ([]*command.ExecuteQueryResponse, uint64, error) {
+		return nil, 0, overloadErr
+	}
+	c.queryFn = func(qr *command.QueryRequest, addr string, t time.Duration) ([]*command.QueryRows, uint64, error) {
+		return nil, 0, overloadErr
+	}
+	c.requestFn = func(eqr *command.ExecuteQueryRequest, nodeAddr string, timeout time.Duration) ([]*command.ExecuteQueryResponse, uint64, uint64, error) {
+		return nil, 0, 0, overloadErr
+	}
+	host := fmt.Sprintf("http://%s", s.Addr().String())
+
+	for _, tc := range []struct {
+		path, body string
+	}{
+		{"/db/execute", writeBody},
+		{"/db/query", readBody},
+		{"/db/request", readBody},
+	} {
+		start := time.Now()
+		resp, err := jsonPost(context.Background(), host, tc.path, tc.body)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("%s: got %d want 503", tc.path, resp.StatusCode)
+		}
+		if time.Since(start) > time.Second {
+			t.Fatalf("%s: overload response not immediate: %s", tc.path, time.Since(start))
+		}
+	}
 }

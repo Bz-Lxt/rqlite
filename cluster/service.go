@@ -20,6 +20,7 @@ import (
 	"github.com/rqlite/rqlite/v10/auth"
 	"github.com/rqlite/rqlite/v10/cluster/proto"
 	command "github.com/rqlite/rqlite/v10/command/proto"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/internal/rsync"
 	pb "google.golang.org/protobuf/proto"
 )
@@ -193,6 +194,12 @@ type Service struct {
 	// connLimiterCh limits the number of in-service connections.
 	connLimiterCh chan struct{}
 
+	// Admission control applied on this executing node to every
+	// forwarded command. Both are nil when admission control is not
+	// configured; nil-receiver calls are no-ops.
+	limiter    *limit.Limiter
+	classifier limit.Classifier
+
 	hwmMu      sync.RWMutex
 	hwmUpdateC chan<- uint64 // Channel for HWM updates
 
@@ -214,12 +221,20 @@ func New(ln net.Listener, db Database, m Manager, credentialStore CredentialStor
 	}
 }
 
+// SetAdmissionControl injects the read/write admission limiter and the
+// statement classifier used for unified requests. It must be called
+// before the service is opened. Passing nil leaves admission control
+// disabled, preserving the default behavior.
+func (s *Service) SetAdmissionControl(l *limit.Limiter, c limit.Classifier) {
+	s.limiter = l
+	s.classifier = c
+}
+
 // Open opens the Service.
 func (s *Service) Open() error {
 	if s.open.Is() {
 		return ErrServiceOpen
 	}
-
 	s.connLimiterCh = make(chan struct{}, s.connLimit)
 	s.open.Set()
 
@@ -365,6 +380,14 @@ func (s *Service) checkCommandPermAll(c *proto.Command, perms ...string) bool {
 func (s *Service) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	// ctx is canceled when the connection closes or stalls. It bounds
+	// admission waits only; in-flight database calls keep using
+	// context.Background() so admitted work is never interrupted.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	watcher := &connCloseWatcher{Conn: conn}
+
 	b := make([]byte, protoBufferLengthSize)
 	for {
 		if s.connTimeout > 0 {
@@ -372,7 +395,7 @@ func (s *Service) handleConn(conn net.Conn) {
 				return
 			}
 		}
-		_, err := io.ReadFull(conn, b)
+		_, err := io.ReadFull(watcher, b)
 		if err != nil {
 			return
 		}
@@ -384,7 +407,7 @@ func (s *Service) handleConn(conn net.Conn) {
 				return
 			}
 		}
-		_, err = io.ReadFull(conn, p)
+		_, err = io.ReadFull(watcher, p)
 		if err != nil {
 			return
 		}
@@ -427,8 +450,11 @@ func (s *Service) handleConn(conn net.Conn) {
 				resp.Error = "ExecuteRequest is nil"
 			} else if !s.checkCommandPerm(c, auth.PermExecute) {
 				resp.Error = "unauthorized"
+			} else if err := s.admit(ctx, cancel, watcher, limit.Write); err != nil {
+				resp.Error = err.Error()
 			} else {
 				res, idx, err := s.db.Execute(context.Background(), er)
+				s.limiter.Release(limit.Write)
 				if err != nil {
 					resp.Error = err.Error()
 				} else {
@@ -449,8 +475,11 @@ func (s *Service) handleConn(conn net.Conn) {
 				resp.Error = "QueryRequest is nil"
 			} else if !s.checkCommandPerm(c, auth.PermQuery) {
 				resp.Error = "unauthorized"
+			} else if err := s.admit(ctx, cancel, watcher, limit.Read); err != nil {
+				resp.Error = err.Error()
 			} else {
 				res, _, idx, err := s.db.Query(context.Background(), qr)
+				s.limiter.Release(limit.Read)
 				if err != nil {
 					resp.Error = err.Error()
 				} else {
@@ -472,13 +501,22 @@ func (s *Service) handleConn(conn net.Conn) {
 			} else if !s.checkCommandPermAll(c, auth.PermQuery, auth.PermExecute) {
 				resp.Error = "unauthorized"
 			} else {
-				res, numRW, idx, err := s.db.Request(context.Background(), rr)
-				if err != nil {
+				class := limit.Write
+				if s.classifier != nil && rr.Request != nil {
+					class = s.classifier.Class(rr.Request.Statements)
+				}
+				if err := s.admit(ctx, cancel, watcher, class); err != nil {
 					resp.Error = err.Error()
 				} else {
-					resp.Response = slices.Clone(res)
-					resp.NumRW = numRW
-					resp.RaftIndex = idx
+					res, numRW, idx, err := s.db.Request(context.Background(), rr)
+					s.limiter.Release(class)
+					if err != nil {
+						resp.Error = err.Error()
+					} else {
+						resp.Response = slices.Clone(res)
+						resp.NumRW = numRW
+						resp.RaftIndex = idx
+					}
 				}
 			}
 			if err := marshalAndWrite(conn, resp); err != nil {
@@ -685,6 +723,41 @@ func (s *Service) handleConn(conn net.Conn) {
 	}
 }
 
+// admit acquires an execution slot for the given class. The common
+// path claims a slot non-blockingly and returns; the disconnect
+// watcher stays idle, so the connection lifecycle (idle read timeout,
+// goroutines) is unchanged. Only when every slot is occupied is the
+// watcher installed around the blocking queue wait: if the client
+// disconnects while queued, the wait is canceled at once and the
+// request never executes.
+func (s *Service) admit(ctx context.Context, cancel context.CancelFunc, w *connCloseWatcher, c limit.Class) error {
+	if s.limiter.TryAcquire(c) {
+		return nil
+	}
+	w.startWatch(cancel)
+	err := s.limiter.Acquire(ctx, c)
+	closed := w.stopWatch()
+	if closed {
+		return reconcileClose(s.limiter, c, err)
+	}
+	return err
+}
+
+// reconcileClose reports the admission outcome after the connection
+// break has been observed. If Acquire already claimed a slot before
+// the cancellation became visible (err == nil), the request is
+// abandoned: the slot is returned and the request is reported
+// canceled, so it is neither executed nor released a second time.
+// Any other Acquire error (its slot handling already settled inside
+// Acquire) passes through unchanged.
+func reconcileClose(l *limit.Limiter, c limit.Class, err error) error {
+	if err == nil {
+		l.Release(c)
+		return context.Canceled
+	}
+	return err
+}
+
 func marshalAndWrite(conn net.Conn, m pb.Message) error {
 	p, err := pb.Marshal(m)
 	if err != nil {
@@ -720,4 +793,91 @@ func gzCompress(b []byte) ([]byte, error) {
 		return nil, fmt.Errorf("gzip Close: %s", err)
 	}
 	return buf.Bytes(), nil
+}
+
+// connCloseWatcher lets the service notice a client disconnect even
+// while it is blocked on something other than a Read, such as an
+// admission-control queue wait. While a watch is active an extra byte
+// is read off the connection; if the client closes, the outstanding
+// Read fails and the watcher cancels the admission context. If a byte
+// arrives (pipelined next command), it is buffered and replayed by
+// Read.
+//
+// stopWatch must be called before the caller issues another Read, to
+// avoid two concurrent readers on the same connection.
+type connCloseWatcher struct {
+	net.Conn
+	mu     sync.Mutex
+	buf    []byte // bytes read by the watcher, not yet replayed
+	watch  chan struct{}
+	closed bool
+}
+
+// Read returns buffered bytes first, then reads from the underlying
+// connection.
+func (w *connCloseWatcher) Read(p []byte) (int, error) {
+	w.mu.Lock()
+	if len(w.buf) > 0 {
+		n := copy(p, w.buf)
+		w.buf = w.buf[n:]
+		w.mu.Unlock()
+		return n, nil
+	}
+	w.mu.Unlock()
+	return w.Conn.Read(p)
+}
+
+// startWatch begins watching for the next inbound byte or a connection
+// close. onClose is invoked if the connection breaks before a byte is
+// read.
+func (w *connCloseWatcher) startWatch(onClose func()) {
+	w.mu.Lock()
+	w.watch = make(chan struct{})
+	w.mu.Unlock()
+
+	// Queue waits may legitimately exceed the idle read timeout, so
+	// watch without a deadline. A client close still wakes the Read
+	// immediately via FIN/RST.
+	_ = w.Conn.SetReadDeadline(time.Time{})
+
+	go func() {
+		one := make([]byte, 1)
+		n, err := w.Conn.Read(one)
+		realClose := err != nil && !errors.Is(err, os.ErrDeadlineExceeded)
+		w.mu.Lock()
+		if n > 0 {
+			w.buf = append(w.buf, one[0])
+		}
+		if realClose {
+			w.closed = true
+		}
+		w.mu.Unlock()
+		// Cancel before the watch is signaled as resolved, so anyone
+		// unblocked by close(watch) is guaranteed to observe the
+		// canceled context.
+		if realClose && onClose != nil {
+			onClose()
+		}
+		close(w.watch)
+	}()
+}
+
+// stopWatch ends an active watch and reports whether the connection
+// actually broke. If the watcher's Read is still outstanding, it is
+// interrupted with an immediate deadline so the goroutine never
+// outlives the queue wait; such an interruption is not a real close.
+func (w *connCloseWatcher) stopWatch() bool {
+	w.mu.Lock()
+	select {
+	case <-w.watch:
+	default:
+		_ = w.Conn.SetReadDeadline(time.Now())
+	}
+	w.mu.Unlock()
+
+	<-w.watch
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.closed
 }

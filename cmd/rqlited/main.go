@@ -30,6 +30,7 @@ import (
 	"github.com/rqlite/rqlite/v10/db"
 	"github.com/rqlite/rqlite/v10/db/extensions"
 	httpd "github.com/rqlite/rqlite/v10/http"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/internal/rarchive"
 	"github.com/rqlite/rqlite/v10/internal/rtls"
 	"github.com/rqlite/rqlite/v10/otlp"
@@ -165,8 +166,18 @@ func main() {
 		log.Fatalf("failed to get credential store: %s", err.Error())
 	}
 
+	// Create the read/write admission limiter. Limits of zero leave
+	// every class unlimited, which is the default and changes no
+	// behavior.
+	admLimiter := limit.New(limit.Config{
+		WriteConcurrency: cfg.WriteConcurrencyLimit,
+		WriteQueue:       cfg.WriteQueueLimit,
+		ReadConcurrency:  cfg.ReadConcurrencyLimit,
+		ReadQueue:        cfg.ReadQueueLimit,
+	})
+
 	// Create cluster service now, so nodes will be able to learn information about each other.
-	clstrServ, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str, str, credStr)
+	clstrServ, err := clusterService(cfg, mux.Listen(cluster.MuxClusterHeader), str, str, credStr, admLimiter, str)
 	if err != nil {
 		log.Fatalf("failed to create cluster service: %s", err.Error())
 	}
@@ -195,7 +206,7 @@ func main() {
 	// We want to start the HTTP server as soon as possible, so the node is responsive and external
 	// systems can see that it's running. We still have to open the Store though, so the node won't
 	// be able to do much until that happens however.
-	httpServ, err := startHTTPService(cfg, str, clstrClient, credStr, pxy)
+	httpServ, err := startHTTPService(cfg, str, clstrClient, credStr, pxy, admLimiter)
 	if err != nil {
 		log.Fatalf("failed to start HTTP server: %s", err.Error())
 	}
@@ -481,13 +492,16 @@ func createDiscoService(cfg *Config, str *store.Store) (*disco.Service, error) {
 	return disco.NewService(c, str, disco.VoterSuffrage(!cfg.RaftNonVoter)), nil
 }
 
-func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credStr *auth.CredentialsStore, pxy *proxy.Proxy) (*httpd.Service, error) {
+func startHTTPService(cfg *Config, str *store.Store, cltr *cluster.Client, credStr *auth.CredentialsStore, pxy *proxy.Proxy, admLimiter *limit.Limiter) (*httpd.Service, error) {
 	// Create HTTP server and load authentication information.
 	var cs httpd.CredentialStore
 	if credStr != nil {
 		cs = credStr
 	}
 	s := httpd.New(cfg.HTTPAddr, str, cltr, pxy, cs)
+
+	s.Limiter = admLimiter
+	s.Classifier = str
 
 	s.CACertFile = cfg.HTTPx509CACert
 	s.CertFile = cfg.HTTPx509Cert
@@ -553,8 +567,10 @@ func credentialStore(cfg *Config) (*auth.CredentialsStore, error) {
 	return auth.NewCredentialsStoreFromFile(cfg.AuthFile)
 }
 
-func clusterService(cfg *Config, ln net.Listener, db cluster.Database, mgr cluster.Manager, credStr *auth.CredentialsStore) (*cluster.Service, error) {
+func clusterService(cfg *Config, ln net.Listener, db cluster.Database, mgr cluster.Manager, credStr *auth.CredentialsStore,
+	lmt *limit.Limiter, clsfr limit.Classifier) (*cluster.Service, error) {
 	c := cluster.New(ln, db, mgr, credStr)
+	c.SetAdmissionControl(lmt, clsfr)
 	c.SetAPIAddr(cfg.HTTPAdv)
 	c.SetVersion(cmd.Version)
 	c.EnableHTTPS(cfg.HTTPx509Cert != "" && cfg.HTTPx509Key != "") // Conditions met for an HTTPS API

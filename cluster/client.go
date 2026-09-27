@@ -17,6 +17,7 @@ import (
 	"github.com/rqlite/rqlite/v10/auth"
 	"github.com/rqlite/rqlite/v10/cluster/proto"
 	command "github.com/rqlite/rqlite/v10/command/proto"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/internal/rtls"
 	"github.com/rqlite/rqlite/v10/tcp"
 	"github.com/rqlite/rqlite/v10/tcp/pool"
@@ -217,7 +218,7 @@ func (c *Client) Execute(ctx context.Context, er *command.ExecuteRequest, nodeAd
 	}
 
 	if a.Error != "" {
-		return nil, 0, errors.New(a.Error)
+		return nil, 0, remoteError(a.Error)
 	}
 	return a.Response, a.RaftIndex, nil
 }
@@ -249,7 +250,7 @@ func (c *Client) Query(ctx context.Context, qr *command.QueryRequest, nodeAddr s
 	}
 
 	if a.Error != "" {
-		return nil, 0, errors.New(a.Error)
+		return nil, 0, remoteError(a.Error)
 	}
 	return a.Rows, a.RaftIndex, nil
 }
@@ -281,7 +282,7 @@ func (c *Client) Request(ctx context.Context, r *command.ExecuteQueryRequest, no
 	}
 
 	if a.Error != "" {
-		return nil, 0, 0, errors.New(a.Error)
+		return nil, 0, 0, remoteError(a.Error)
 	}
 	return a.Response, a.NumRW, a.RaftIndex, nil
 }
@@ -897,4 +898,15 @@ func handleConnError(conn net.Conn) {
 	if pc, ok := conn.(*pool.Conn); ok {
 		pc.MarkUnusable()
 	}
+}
+
+// remoteError converts an error message returned by a remote node into
+// an error. An admission-control overload is wrapped around
+// limit.ErrOverloaded so callers can detect it via errors.Is and map
+// it to HTTP 503; any other message becomes a plain error.
+func remoteError(msg string) error {
+	if msg == limit.ErrOverloaded.Error() {
+		return fmt.Errorf("%w", limit.ErrOverloaded)
+	}
+	return errors.New(msg)
 }

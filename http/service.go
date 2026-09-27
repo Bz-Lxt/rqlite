@@ -29,6 +29,7 @@ import (
 	"github.com/rqlite/rqlite/v10/db"
 	"github.com/rqlite/rqlite/v10/http/console"
 	"github.com/rqlite/rqlite/v10/http/licenses"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/internal/rtls"
 	"github.com/rqlite/rqlite/v10/proxy"
 	"github.com/rqlite/rqlite/v10/queue"
@@ -296,6 +297,13 @@ type Service struct {
 	DefaultQueueTimeout time.Duration
 	DefaultQueueTx      bool
 
+	// Limiter optionally bounds concurrency and queueing per read/write
+	// class for the synchronous execute, query, and request endpoints.
+	// A nil Limiter imposes no limits. Classifier classifies unified
+	// requests; when nil, unified requests are treated as writes.
+	Limiter    *limit.Limiter
+	Classifier limit.Classifier
+
 	seqNum int64 // Last sequence number written OK.
 
 	credentialStore CredentialStore
@@ -426,11 +434,26 @@ func (s *Service) SetAllowOrigin(origin string) {
 	s.allowOrigin = origin
 }
 
-// AllowOrigin returns the value for the Access-Control-Allow-Origin header.
+// AllowOrigin returns the value for the Access-Control-Allow-Origin.
 func (s *Service) AllowOrigin() string {
 	s.aoMu.RLock()
 	defer s.aoMu.RUnlock()
 	return s.allowOrigin
+}
+
+// acquire obtains an admission slot in the given class before the
+// request touches the proxy. If the node is overloaded it writes a 503;
+// if the request context is already canceled it writes nothing (the
+// client has gone). It returns true when the caller may proceed; the
+// caller must release the slot in that case.
+func (s *Service) acquire(w http.ResponseWriter, r *http.Request, class limit.Class) bool {
+	if err := s.Limiter.Acquire(r.Context(), class); err != nil {
+		if errors.Is(err, limit.ErrOverloaded) {
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		}
+		return false
+	}
+	return true
 }
 
 // ServeHTTP allows Service to serve HTTP requests.
@@ -1365,6 +1388,11 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams
 		}
 	}
 
+	if !s.acquire(w, r, limit.Write) {
+		return
+	}
+	defer s.Limiter.Release(limit.Write)
+
 	er := &proto.ExecuteRequest{
 		Request: &proto.Request{
 			Transaction: qp.Tx(),
@@ -1388,6 +1416,11 @@ func (s *Service) execute(w http.ResponseWriter, r *http.Request, qp QueryParams
 		}
 		if errors.Is(resultsErr, proxy.ErrUnauthorized) {
 			http.Error(w, "remote Execute not authorized", http.StatusUnauthorized)
+			return
+		}
+		if errors.Is(resultsErr, limit.ErrOverloaded) {
+			// The executing node shed the forwarded request.
+			http.Error(w, limit.ErrOverloaded.Error(), http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -1454,6 +1487,11 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryPa
 	resp.Results.AssociativeJSON = qp.Associative()
 	resp.Results.BlobsAsArrays = qp.BlobArray()
 
+	if !s.acquire(w, r, limit.Read) {
+		return
+	}
+	defer s.Limiter.Release(limit.Read)
+
 	qr := &proto.QueryRequest{
 		Request: &proto.Request{
 			Transaction:    qp.Tx(),
@@ -1482,6 +1520,11 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request, qp QueryPa
 		}
 		if errors.Is(resultsErr, proxy.ErrUnauthorized) {
 			http.Error(w, "remote query not authorized", http.StatusUnauthorized)
+			return
+		}
+		if errors.Is(resultsErr, limit.ErrOverloaded) {
+			// The executing node shed the forwarded request.
+			http.Error(w, limit.ErrOverloaded.Error(), http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -1530,6 +1573,15 @@ func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp Query
 	resp.Results.AssociativeJSON = qp.Associative()
 	resp.Results.BlobsAsArrays = qp.BlobArray()
 
+	class := limit.Write
+	if s.Classifier != nil {
+		class = s.Classifier.Class(stmts)
+	}
+	if !s.acquire(w, r, class) {
+		return
+	}
+	defer s.Limiter.Release(class)
+
 	eqr := &proto.ExecuteQueryRequest{
 		Request: &proto.Request{
 			Transaction:    qp.Tx(),
@@ -1557,6 +1609,11 @@ func (s *Service) handleRequest(w http.ResponseWriter, r *http.Request, qp Query
 		}
 		if errors.Is(resultsErr, proxy.ErrUnauthorized) {
 			http.Error(w, "remote Request not authorized", http.StatusUnauthorized)
+			return
+		}
+		if errors.Is(resultsErr, limit.ErrOverloaded) {
+			// The executing node shed the forwarded request.
+			http.Error(w, limit.ErrOverloaded.Error(), http.StatusServiceUnavailable)
 			return
 		}
 	}

@@ -607,6 +607,50 @@ long_help = """
 default = false
 
 [[flags]]
+name = "WriteConcurrencyLimit"
+cli = "write-concurrency-limit"
+section = "Admission Control"
+type = "int"
+short_help = "Maximum number of concurrent writes. Set to 0 to disable"
+long_help = """
+When set, a write acquires a write-class concurrency slot before any execution or forwarding begins. If every slot is occupied and the write queue is full, the request is rejected with HTTP 503. Set to zero to disable admission control, which is the default.
+"""
+default = 0
+
+[[flags]]
+name = "WriteQueueLimit"
+cli = "write-queue-limit"
+section = "Admission Control"
+type = "int"
+short_help = "Maximum number of writes queued for a concurrency slot. Set to 0 to reject immediately"
+long_help = """
+When all write concurrency slots are occupied, requests wait in FIFO order up to this queue depth. A request canceled while queued is removed and never executed. Set to zero to reject overloaded writes immediately.
+"""
+default = 0
+
+[[flags]]
+name = "ReadConcurrencyLimit"
+cli = "read-concurrency-limit"
+section = "Admission Control"
+type = "int"
+short_help = "Maximum number of concurrent read requests. Set to 0 to disable"
+long_help = """
+When set, a read request acquires a read-class concurrency slot before query execution or forwarding begins. The read and write pools are independent. Set to zero to disable admission control, which is the default.
+"""
+default = 0
+
+[[flags]]
+name = "ReadQueueLimit"
+cli = "read-queue-limit"
+section = "Admission Control"
+type = "int"
+short_help = "Maximum number of reads queued for a concurrency slot. Set to 0 to reject immediately"
+long_help = """
+When all read concurrency slots are occupied, requests wait in FIFO order up to this queue depth. A request canceled while queued is removed and never executed. Set to zero to reject overloaded reads immediately.
+"""
+default = 0
+
+[[flags]]
 name = "AutoBackupFile"
 cli = "auto-backup"
 section = "Backup and restore"

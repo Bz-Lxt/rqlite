@@ -4,17 +4,22 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"expvar"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rqlite/rqlite/v10/cluster/proto"
 	command "github.com/rqlite/rqlite/v10/command/proto"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/testdata/x509"
+	pb "google.golang.org/protobuf/proto"
 )
 
 func Test_NewServiceOpenClose(t *testing.T) {
@@ -831,4 +836,594 @@ func makeCredentials(username, password string) *proto.Credentials {
 		Username: username,
 		Password: password,
 	}
+}
+
+// mockClassifier is a Classifier driven by a function.
+type mockClassifier func(stmts []*command.Statement) limit.Class
+
+func (f mockClassifier) Class(stmts []*command.Statement) limit.Class { return f(stmts) }
+
+// newAdmissionClusterService opens a cluster service gated by the given
+// limiter configuration and returns it with its backing database.
+func newAdmissionClusterService(t *testing.T, cfg limit.Config) (*Service, *mockDatabase, *limit.Limiter) {
+	t.Helper()
+	limit.ResetStats()
+	db := mustNewMockDatabase()
+	l := limit.New(cfg)
+	s := New(mustNewMockTransport(), db, mustNewMockManager(), mustNewMockCredentialStore())
+	s.SetAdmissionControl(l, nil)
+	if err := s.Open(); err != nil {
+		t.Fatalf("failed to open cluster service: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s, db, l
+}
+
+// blockExecute makes the database Execute call block until the hold
+// channel closes. It returns a signal channel closed once a call has
+// entered, the hold channel, and a counter of invocations.
+func blockExecute(db *mockDatabase) (chan struct{}, chan struct{}, *int32) {
+	started := make(chan struct{})
+	hold := make(chan struct{})
+	var invocations int32
+	db.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		atomic.AddInt32(&invocations, 1)
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-hold
+		return []*command.ExecuteQueryResponse{}, 1, nil
+	}
+	return started, hold, &invocations
+}
+
+func blockQuery(db *mockDatabase) (chan struct{}, chan struct{}) {
+	started := make(chan struct{})
+	hold := make(chan struct{})
+	db.queryFn = func(qr *command.QueryRequest) ([]*command.QueryRows, uint64, error) {
+		select {
+		case <-started:
+		default:
+			close(started)
+		}
+		<-hold
+		return []*command.QueryRows{}, 1, nil
+	}
+	return started, hold
+}
+
+func clientExecute(t *testing.T, s *Service, cl *Client, timeout time.Duration) error {
+	t.Helper()
+	_, _, err := cl.Execute(context.Background(), &command.ExecuteRequest{}, s.Addr(), nil, timeout, noRetries)
+	return err
+}
+
+// Test_ClusterExecuteQueryClassPools (TR-4.1): executes occupy the
+// write pool, queries the read pool; saturation of one never affects
+// the other.
+func Test_ClusterExecuteQueryClassPools(t *testing.T) {
+	s, db, _ := newAdmissionClusterService(t, limit.Config{
+		WriteConcurrency: 1, ReadConcurrency: 1,
+	})
+
+	// Write pool: second execute rejected, query still succeeds.
+	started, hold, _ := blockExecute(db)
+	c1 := NewClient(mustNewMockTransport(), 30*time.Second)
+	go func() {
+		if err := clientExecute(t, s, c1, 10*time.Second); err != nil {
+			t.Errorf("first execute: %v", err)
+		}
+	}()
+	<-started
+
+	c2 := NewClient(mustNewMockTransport(), 30*time.Second)
+	err := clientExecute(t, s, c2, 5*time.Second)
+	if err == nil || err.Error() != limit.ErrOverloaded.Error() {
+		t.Fatalf("second execute: got %v want %q", err, limit.ErrOverloaded.Error())
+	}
+	cl := NewClient(mustNewMockTransport(), 30*time.Second)
+	if _, _, err := cl.Query(context.Background(), &command.QueryRequest{}, s.Addr(), nil, 5*time.Second, noRetries); err != nil {
+		t.Fatalf("query with write full: %v", err)
+	}
+
+	close(hold)
+
+	// Read pool: second query rejected, execute still succeeds.
+	qStarted, qHold := blockQuery(db)
+	cq1 := NewClient(mustNewMockTransport(), 30*time.Second)
+	go func() {
+		if _, _, err := cq1.Query(context.Background(), &command.QueryRequest{}, s.Addr(), nil, 10*time.Second, noRetries); err != nil {
+			t.Errorf("first query: %v", err)
+		}
+	}()
+	<-qStarted
+
+	cq2 := NewClient(mustNewMockTransport(), 30*time.Second)
+	_, _, err = cq2.Query(context.Background(), &command.QueryRequest{}, s.Addr(), nil, 5*time.Second, noRetries)
+	if err == nil || err.Error() != limit.ErrOverloaded.Error() {
+		t.Fatalf("second query: got %v want %q", err, limit.ErrOverloaded.Error())
+	}
+	if err := clientExecute(t, s, NewClient(mustNewMockTransport(), 30*time.Second), 5*time.Second); err != nil {
+		t.Fatalf("execute with read full: %v", err)
+	}
+
+	close(qHold)
+}
+
+// Test_ClusterRequestClassifiesByStatements (TR-4.1 REQUEST): a
+// unified request takes the class reported by the classifier.
+func Test_ClusterRequestClassifiesByStatements(t *testing.T) {
+	s, db, _ := newAdmissionClusterService(t, limit.Config{
+		WriteConcurrency: 1, ReadConcurrency: 1,
+	})
+	s.classifier = mockClassifier(func(stmts []*command.Statement) limit.Class {
+		for _, st := range stmts {
+			if !strings.HasPrefix(strings.ToUpper(st.Sql), "SELECT") {
+				return limit.Write
+			}
+		}
+		return limit.Read
+	})
+
+	// Fill the read pool.
+	qStarted, qHold := blockQuery(db)
+	blocking := NewClient(mustNewMockTransport(), 30*time.Second)
+	go func() {
+		blocking.Query(context.Background(), &command.QueryRequest{}, s.Addr(), nil, 10*time.Second, noRetries)
+	}()
+	<-qStarted
+
+	cl := NewClient(mustNewMockTransport(), 30*time.Second)
+	readReq := &command.ExecuteQueryRequest{
+		Request: &command.Request{Statements: []*command.Statement{{Sql: "SELECT * FROM foo"}}},
+	}
+	_, _, _, err := cl.Request(context.Background(), readReq, s.Addr(), nil, 5*time.Second, noRetries)
+	if err == nil || err.Error() != limit.ErrOverloaded.Error() {
+		t.Fatalf("read-only request with read full: got %v want overload", err)
+	}
+
+	writeReq := &command.ExecuteQueryRequest{
+		Request: &command.Request{Statements: []*command.Statement{{Sql: "INSERT INTO foo VALUES(1)"}}},
+	}
+	if _, _, _, err := cl.Request(context.Background(), writeReq, s.Addr(), nil, 5*time.Second, noRetries); err != nil {
+		t.Fatalf("write request with read full: %v", err)
+	}
+
+	close(qHold)
+}
+
+// Test_ClusterQueueAndOverloadError (TR-4.2): saturation queues up to
+// the configured depth; beyond it the overload error is carried back
+// through the command response.
+func Test_ClusterQueueAndOverloadError(t *testing.T) {
+	s, db, l := newAdmissionClusterService(t, limit.Config{
+		WriteConcurrency: 1, WriteQueue: 1,
+	})
+
+	started, hold, _ := blockExecute(db)
+	c1 := NewClient(mustNewMockTransport(), 30*time.Second)
+	c1Done := make(chan error, 1)
+	go func() {
+		c1Done <- clientExecute(t, s, c1, 10*time.Second)
+	}()
+	<-started
+
+	c2 := NewClient(mustNewMockTransport(), 30*time.Second)
+	c2Done := make(chan error, 1)
+	go func() {
+		c2Done <- clientExecute(t, s, c2, 10*time.Second)
+	}()
+	waitForGauge(l, "write", "queued", 1)
+
+	c3 := NewClient(mustNewMockTransport(), 30*time.Second)
+	start := time.Now()
+	err := clientExecute(t, s, c3, 5*time.Second)
+	if err == nil || err.Error() != limit.ErrOverloaded.Error() {
+		t.Fatalf("third execute: got %v want overload", err)
+	}
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("overload error not immediate: %s", time.Since(start))
+	}
+
+	close(hold)
+	if err := <-c1Done; err != nil {
+		t.Errorf("first execute: %v", err)
+	}
+	if err := <-c2Done; err != nil {
+		t.Errorf("queued execute: %v", err)
+	}
+}
+
+// Test_ClusterQueueCancelOnConnClose (TR-4.3): a queued command is
+// canceled when its connection closes; it is never executed and the
+// capacity is recovered.
+func Test_ClusterQueueCancelOnConnClose(t *testing.T) {
+	s, db, l := newAdmissionClusterService(t, limit.Config{
+		WriteConcurrency: 1, WriteQueue: 1,
+	})
+
+	started, hold, invocations := blockExecute(db)
+	c1 := NewClient(mustNewMockTransport(), 30*time.Second)
+	go func() {
+		clientExecute(t, s, c1, 10*time.Second)
+	}()
+	<-started
+
+	// Send a second command over a raw connection and leave it queued.
+	raw, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	cmd := &proto.Command{
+		Type: proto.Command_COMMAND_TYPE_EXECUTE,
+		Request: &proto.Command_ExecuteRequest{
+			ExecuteRequest: &command.ExecuteRequest{},
+		},
+	}
+	p, err := pb.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := writeBytesWithLength(raw, p); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	waitForGauge(l, "write", "queued", 1)
+
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw conn: %v", err)
+	}
+	waitForExpvarInt("num_queue_canceled", 1)
+	waitForGauge(l, "write", "queued", 0)
+
+	close(hold)
+
+	// The queued command must never have executed.
+	if got := atomic.LoadInt32(invocations); got != 1 {
+		t.Fatalf("db execute invocations: got %d want 1", got)
+	}
+	// Capacity is fully recovered.
+	if err := clientExecute(t, s, NewClient(mustNewMockTransport(), 30*time.Second), 5*time.Second); err != nil {
+		t.Fatalf("execute after cancel: %v", err)
+	}
+}
+
+// Test_ClusterSharedPoolAcrossConnections (TR-4.4): commands arriving
+// on independent connections share the same class pool.
+func Test_ClusterSharedPoolAcrossConnections(t *testing.T) {
+	s, db, l := newAdmissionClusterService(t, limit.Config{WriteConcurrency: 2})
+
+	started, hold, _ := blockExecute(db)
+	done := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		cl := NewClient(mustNewMockTransport(), 30*time.Second)
+		go func() {
+			done <- clientExecute(t, s, cl, 10*time.Second)
+		}()
+	}
+	<-started // Same fn closes started once; wait for gauge 2 below.
+	waitForGauge(l, "write", "in_flight", 2)
+
+	c3 := NewClient(mustNewMockTransport(), 30*time.Second)
+	err := clientExecute(t, s, c3, 5*time.Second)
+	if err == nil || err.Error() != limit.ErrOverloaded.Error() {
+		t.Fatalf("third execute: got %v want overload", err)
+	}
+
+	close(hold)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Errorf("in-flight execute %d: %v", i, err)
+		}
+	}
+}
+
+func waitForGauge(l *limit.Limiter, class, key string, want any) {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if l.Stats()[class].(map[string]any)[key] == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	panic(fmt.Sprintf("timed out waiting for %s.%s == %v (got %v)", class, key, want, l.Stats()[class]))
+}
+
+func waitForExpvarInt(key string, want int64) {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		m := expvar.Get("limit")
+		if m != nil && m.(*expvar.Map).Get(key).(*expvar.Int).Value() == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	panic(fmt.Sprintf("timed out waiting for expvar %s == %d", key, want))
+}
+
+// Test_ServiceClosesIdleAfterCommand (TR-I-1.1): with admission
+// control unset (nil limiter), a connection that has sent one command
+// and then goes idle is still reaped at the connection read timeout,
+// exactly as before admission control existed.
+func Test_ServiceClosesIdleAfterCommand(t *testing.T) {
+	ml := mustNewMockTransport()
+	s := New(ml, mustNewMockDatabase(), mustNewMockManager(), mustNewMockCredentialStore())
+	s.connTimeout = 500 * time.Millisecond
+
+	if err := s.Open(); err != nil {
+		t.Fatalf("failed to open cluster service")
+	}
+	defer s.Close()
+
+	conn, err := net.Dial("tcp", s.Addr())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send one EXECUTE; it takes the nil-limiter fast path, so no
+	// watcher goroutine is started and no deadline is touched.
+	cmd := &proto.Command{
+		Type: proto.Command_COMMAND_TYPE_EXECUTE,
+		Request: &proto.Command_ExecuteRequest{
+			ExecuteRequest: &command.ExecuteRequest{},
+		},
+	}
+	p, err := pb.Marshal(cmd)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := writeBytesWithLength(conn, p); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	respBytes, err := readResponse(conn, 5*time.Second)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	resp := &proto.CommandExecuteResponse{}
+	if err := pb.Unmarshal(respBytes, resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if resp.Error != "" {
+		t.Fatalf("unexpected response error: %s", resp.Error)
+	}
+
+	// Idle: the server must close the conn at about connTimeout.
+	start := time.Now()
+	one := make([]byte, 1)
+	if _, err = conn.Read(one); err != io.EOF {
+		t.Fatalf("expected io.EOF, got: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 350*time.Millisecond {
+		t.Fatalf("idle connection closed too soon: %s", elapsed)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("idle connection not reaped at connTimeout: %s", elapsed)
+	}
+}
+
+// Test_ClientRemoteOverloadSentinel (TR-I-2.1): when the executing
+// database reports admission overload, the error returned through the
+// client still satisfies errors.Is(err, limit.ErrOverloaded), so entry
+// nodes can detect it and map it to HTTP 503.
+func Test_ClientRemoteOverloadSentinel(t *testing.T) {
+	s, db, _ := newAdmissionClusterService(t, limit.Config{WriteConcurrency: 1})
+	db.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+		return nil, 0, limit.ErrOverloaded
+	}
+
+	cl := NewClient(mustNewMockTransport(), 30*time.Second)
+	_, _, err := cl.Execute(context.Background(), &command.ExecuteRequest{}, s.Addr(), nil, 5*time.Second, noRetries)
+	if !errors.Is(err, limit.ErrOverloaded) {
+		t.Fatalf("expected errors.Is ErrOverloaded, got: %v", err)
+	}
+}
+
+// Test_AdmitPromoteCloseRace (TR-I-3.1/3.2): stress the window in
+// which a queued request is promoted by a slot release at the same
+// moment its client disconnects. An abandoned request must never
+// reach the database, and the class slot capacity must never decay.
+func Test_AdmitPromoteCloseRace(t *testing.T) {
+	const (
+		N      = 2
+		rounds = 300
+	)
+	limit.ResetStats()
+	db := mustNewMockDatabase()
+	lmt := limit.New(limit.Config{WriteConcurrency: N, WriteQueue: 1})
+	ml := mustNewMockTransport()
+	defer ml.Close()
+	s := New(mustNewMockTransport(), db, mustNewMockManager(), mustNewMockCredentialStore())
+	s.SetAdmissionControl(lmt, nil)
+	if err := s.Open(); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	var invocations int64
+	var extraTotal int64 // queued requests admitted before close observed
+
+	for round := 0; round < rounds; round++ {
+		holds := make([]chan struct{}, N)
+		for i := range holds {
+			holds[i] = make(chan struct{})
+		}
+		started := make(chan struct{}, N)
+		var callIdx int64
+		db.executeFn = func(er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
+			i := atomic.AddInt64(&callIdx, 1) - 1
+			atomic.AddInt64(&invocations, 1)
+			if int(i) >= N {
+				// X was promoted before the disconnect was observed:
+				// it holds a real slot and returns immediately.
+				atomic.AddInt64(&extraTotal, 1)
+				return []*command.ExecuteQueryResponse{}, 1, nil
+			}
+			started <- struct{}{}
+			<-holds[i]
+			return []*command.ExecuteQueryResponse{}, 1, nil
+		}
+
+		holderDone := make(chan error, N)
+		for i := 0; i < N; i++ {
+			cl := NewClient(ml, 30*time.Second)
+			go func() {
+				holderDone <- clientExecute(t, s, cl, 10*time.Second)
+			}()
+		}
+		for i := 0; i < N; i++ {
+			select {
+			case <-started:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("round %d: holder %d did not start", round, i)
+			}
+		}
+
+		// Park one request in the queue on a raw connection.
+		raw, err := net.Dial("tcp", s.Addr())
+		if err != nil {
+			t.Fatalf("round %d dial: %v", round, err)
+		}
+		cmd := &proto.Command{
+			Type: proto.Command_COMMAND_TYPE_EXECUTE,
+			Request: &proto.Command_ExecuteRequest{
+				ExecuteRequest: &command.ExecuteRequest{},
+			},
+		}
+		p, err := pb.Marshal(cmd)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if err := writeBytesWithLength(raw, p); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		waitForGauge(lmt, "write", "queued", 1)
+
+		// Race the disconnect against a slot release.
+		closed := make(chan struct{})
+		go func() {
+			raw.Close()
+			close(closed)
+		}()
+		go close(holds[0])
+		select {
+		case <-closed:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: raw close hung", round)
+		}
+
+		// Release the other holders and drain them.
+		for i := 1; i < N; i++ {
+			close(holds[i])
+		}
+		for i := 0; i < N; i++ {
+			select {
+			case err := <-holderDone:
+				if err != nil {
+					t.Fatalf("round %d holder: %v", round, err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatalf("round %d: holder %d hung", round, i)
+			}
+		}
+
+		// Settle: no queued waiters, no in-flight work. If X was
+		// admitted its fn returns instantly, so in_flight reaching 0
+		// implies every fn this round has completed.
+		waitForGauge(lmt, "write", "queued", 0)
+		waitForGauge(lmt, "write", "in_flight", 0)
+
+		// At most one extra execution per round: the single X when it
+		// was promoted before the disconnect became observable (then
+		// it is an admitted, in-flight request the spec leaves alone).
+		// A closed-observed X can never invoke the fn.
+		got := atomic.LoadInt64(&invocations)
+		wantMin := int64(N * (round + 1))
+		wantMax := wantMin + int64(round+1)
+		if got < wantMin || got > wantMax {
+			t.Fatalf("round %d: invocations got %d want in [%d,%d]", round, got, wantMin, wantMax)
+		}
+
+		// All N slots must remain claimable: capacity did not decay.
+		for i := 0; i < N; i++ {
+			if !lmt.TryAcquire(limit.Write) {
+				t.Fatalf("round %d: slot %d not claimable, capacity decayed", round, i)
+			}
+		}
+		for i := 0; i < N; i++ {
+			lmt.Release(limit.Write)
+		}
+	}
+	t.Logf("admitted-before-close requests: %d / %d rounds", atomic.LoadInt64(&extraTotal), rounds)
+}
+
+// Test_ReconcileClose (TR-I-3.1): the promotion/disconnect race
+// branch — Acquire returned nil but the connection had broken — must
+// return the slot and report canceled instead of success.
+func Test_ReconcileClose(t *testing.T) {
+	l := limit.New(limit.Config{WriteConcurrency: 1})
+
+	// Simulate Acquire having claimed the only slot.
+	if !l.TryAcquire(limit.Write) {
+		t.Fatal("setup: expected to claim the slot")
+	}
+	if err := reconcileClose(l, limit.Write, nil); !errors.Is(err, context.Canceled) {
+		t.Fatalf("reconcileClose nil: got %v want context.Canceled", err)
+	}
+	// The slot was handed back.
+	if !l.TryAcquire(limit.Write) {
+		t.Fatal("slot not claimable: capacity decayed")
+	}
+	l.Release(limit.Write)
+
+	// Non-nil errors (including overload) pass through untouched.
+	sentinel := errors.New("some acquire error")
+	if err := reconcileClose(l, limit.Write, sentinel); !errors.Is(err, sentinel) {
+		t.Fatalf("reconcileClose error: got %v want %v", err, sentinel)
+	}
+}
+
+// Test_AdmitQueuedDisconnect (TR-I-3.1): a client that disconnects
+// while its request is queued never executes; the promoted slot goes
+// to no one and capacity stays intact.
+func Test_AdmitQueuedDisconnect(t *testing.T) {
+	l := limit.New(limit.Config{WriteConcurrency: 1, WriteQueue: 1})
+	s := &Service{limiter: l}
+	server, client := net.Pipe()
+	defer server.Close()
+
+	// Hold the only slot.
+	if !l.TryAcquire(limit.Write) {
+		t.Fatal("setup: expected to claim the only slot")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := &connCloseWatcher{Conn: server}
+	result := make(chan error, 1)
+	go func() {
+		result <- s.admit(ctx, cancel, w, limit.Write)
+	}()
+
+	// Disconnect while the request is still queued.
+	if err := client.Close(); err != nil {
+		t.Fatalf("client close: %v", err)
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("admit: got %v want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("admit hung")
+	}
+
+	// Releasing the held slot leaves exactly one claimable slot.
+	l.Release(limit.Write)
+	if !l.TryAcquire(limit.Write) {
+		t.Fatal("slot not claimable: capacity decayed")
+	}
+	l.Release(limit.Write)
 }

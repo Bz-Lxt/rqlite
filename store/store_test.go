@@ -17,6 +17,7 @@ import (
 	"github.com/rqlite/rqlite/v10/command/proto"
 	"github.com/rqlite/rqlite/v10/db"
 	"github.com/rqlite/rqlite/v10/internal/fsutil"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/internal/random"
 	"github.com/rqlite/rqlite/v10/internal/rarchive"
 	"github.com/rqlite/rqlite/v10/snapshot"
@@ -2864,6 +2865,107 @@ func Test_RWROCount(t *testing.T) {
 		})
 	}
 
+}
+
+func Test_StoreClass(t *testing.T) {
+	s, ln := mustNewStore(t)
+	defer ln.Close()
+
+	if err := s.Open(); err != nil {
+		t.Fatalf("failed to open single-node store: %s", err.Error())
+	}
+	defer s.Close(true)
+	if err := s.Bootstrap(NewServer(s.ID(), s.Addr(), true)); err != nil {
+		t.Fatalf("failed to bootstrap single-node store: %s", err.Error())
+	}
+	if _, err := s.WaitForLeader(10 * time.Second); err != nil {
+		t.Fatalf("Error waiting for leader: %s", err)
+	}
+
+	er := executeRequestFromString(`CREATE TABLE foo (id INTEGER NOT NULL PRIMARY KEY, name TEXT)`,
+		false, false)
+	if _, _, err := s.Execute(context.Background(), er); err != nil {
+		t.Fatalf("failed to execute on single node: %s", err.Error())
+	}
+
+	stmtsFromStrings := func(ss []string) []*proto.Statement {
+		return executeQueryRequestFromStrings(ss, proto.ConsistencyLevel_NONE, false, false, false).Request.Statements
+	}
+
+	tests := []struct {
+		name   string
+		stmts  []*proto.Statement
+		expect limit.Class
+	}{
+		{
+			name:   "Empty SQL skipped, all read",
+			stmts:  stmtsFromStrings([]string{"", "SELECT * FROM foo"}),
+			expect: limit.Read,
+		},
+		{
+			name:   "Single SELECT",
+			stmts:  stmtsFromStrings([]string{"SELECT * FROM foo"}),
+			expect: limit.Read,
+		},
+		{
+			name:   "Multiple SELECTs",
+			stmts:  stmtsFromStrings([]string{"SELECT * FROM foo", "SELECT 1"}),
+			expect: limit.Read,
+		},
+		{
+			name: "EXPLAIN flag treated as read-only",
+			stmts: []*proto.Statement{
+				{Sql: "INSERT INTO foo(id) VALUES(1)", SqlExplain: true},
+			},
+			expect: limit.Read,
+		},
+		{
+			name:   "Single INSERT",
+			stmts:  stmtsFromStrings([]string{"INSERT INTO foo(id, name) VALUES(1, 'fiona')"}),
+			expect: limit.Write,
+		},
+		{
+			name: "Mixed SELECT and INSERT",
+			stmts: stmtsFromStrings([]string{
+				"SELECT * FROM foo",
+				"INSERT INTO foo(id, name) VALUES(2, 'fiona2')",
+			}),
+			expect: limit.Write,
+		},
+		{
+			name:   "DDL statement",
+			stmts:  stmtsFromStrings([]string{"CREATE TABLE bar (id INTEGER)"}),
+			expect: limit.Write,
+		},
+		{
+			name:   "Junk SQL",
+			stmts:  stmtsFromStrings([]string{"asdkflj asgkdj"}),
+			expect: limit.Write,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := s.Class(tt.stmts); got != tt.expect {
+				t.Fatalf("Class: got %v want %v", got, tt.expect)
+			}
+			// Class must agree with RORWCount.
+			rwN, _ := s.RORWCount(&proto.ExecuteQueryRequest{
+				Request: &proto.Request{Statements: tt.stmts},
+			})
+			hasWrite := rwN > 0
+			if got := s.Class(tt.stmts) == limit.Write; got != hasWrite {
+				t.Fatalf("Class disagrees with RORWCount: class write=%v rwN=%d", got, rwN)
+			}
+		})
+	}
+
+	// A Store without a database conservatively reports Write.
+	s2, ln2 := mustNewStore(t)
+	defer ln2.Close()
+	if got := s2.Class(stmtsFromStrings([]string{"SELECT 1"})); got != limit.Write {
+		t.Fatalf("closed db Class: got %v want %v", got, limit.Write)
+	}
 }
 
 func Test_StoreExecuteRaftIndex(t *testing.T) {

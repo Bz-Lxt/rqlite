@@ -124,6 +124,14 @@ type Config struct {
 	WriteQueueTimeout time.Duration
 	// Use a transaction when processing a queued write
 	WriteQueueTx bool
+	// Maximum number of concurrent writes. Set to 0 to disable
+	WriteConcurrencyLimit int
+	// Maximum number of writes queued for a concurrency slot. Set to 0 to reject immediately
+	WriteQueueLimit int
+	// Maximum number of concurrent read requests. Set to 0 to disable
+	ReadConcurrencyLimit int
+	// Maximum number of reads queued for a concurrency slot. Set to 0 to reject immediately
+	ReadQueueLimit int
 	// Path to automatic backup configuration file. If not set, not enabled
 	AutoBackupFile string
 	// Path to automatic restore configuration file. If not set, not enabled
@@ -215,6 +223,10 @@ func Forge(arguments []string) (*flag.FlagSet, *Config, error) {
 	fs.IntVar(&config.WriteQueueBatchSz, "write-queue-batch-size", 128, "Queued Writes queue batch size")
 	fs.DurationVar(&config.WriteQueueTimeout, "write-queue-timeout", mustParseDuration("50ms"), "Queued Writes queue timeout")
 	fs.BoolVar(&config.WriteQueueTx, "write-queue-tx", false, "Use a transaction when processing a queued write")
+	fs.IntVar(&config.WriteConcurrencyLimit, "write-concurrency-limit", 0, "Maximum number of concurrent writes. Set to 0 to disable")
+	fs.IntVar(&config.WriteQueueLimit, "write-queue-limit", 0, "Maximum number of writes queued for a concurrency slot. Set to 0 to reject immediately")
+	fs.IntVar(&config.ReadConcurrencyLimit, "read-concurrency-limit", 0, "Maximum number of concurrent read requests. Set to 0 to disable")
+	fs.IntVar(&config.ReadQueueLimit, "read-queue-limit", 0, "Maximum number of reads queued for a concurrency slot. Set to 0 to reject immediately")
 	fs.StringVar(&config.AutoBackupFile, "auto-backup", "", "Path to automatic backup configuration file. If not set, not enabled")
 	fs.StringVar(&config.AutoRestoreFile, "auto-restore", "", "Path to automatic restore configuration file. If not set, not enabled")
 	fs.StringVar(&config.CDCConfig, "cdc-config", "", "Set CDC HTTP endpoint, or path to CDC config file. If not set, CDC not enabled")

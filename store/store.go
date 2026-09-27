@@ -32,6 +32,7 @@ import (
 	sql "github.com/rqlite/rqlite/v10/db"
 	"github.com/rqlite/rqlite/v10/db/humanize"
 	"github.com/rqlite/rqlite/v10/internal/fsutil"
+	"github.com/rqlite/rqlite/v10/internal/limit"
 	"github.com/rqlite/rqlite/v10/internal/progress"
 	"github.com/rqlite/rqlite/v10/internal/random"
 	"github.com/rqlite/rqlite/v10/internal/rsum"
@@ -2290,6 +2291,31 @@ func (s *Store) Noop(id string) (raft.ApplyFuture, error) {
 	}
 
 	return s.raft.Apply(bc, s.ApplyTimeout), nil
+}
+
+// Class returns the admission class of the given statements. It returns
+// limit.Read only when every non-empty statement can be proven to be
+// read-only; any write statement, a statement that fails to prepare, or
+// a missing/closed database causes it to conservatively return
+// limit.Write. The classification rules match RORWCount, so the two
+// never disagree.
+func (s *Store) Class(stmts []*proto.Statement) limit.Class {
+	if s.db == nil {
+		return limit.Write
+	}
+	for _, stmt := range stmts {
+		if stmt.Sql == "" {
+			continue
+		}
+		if stmt.SqlExplain {
+			continue
+		}
+		ro, err := s.db.StmtReadOnly(stmt.Sql)
+		if err != nil || !ro {
+			return limit.Write
+		}
+	}
+	return limit.Read
 }
 
 // RORWCount returns the number of read-only and read-write statements in the
