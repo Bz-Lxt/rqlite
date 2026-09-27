@@ -16,6 +16,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -203,6 +204,15 @@ const (
 	// node (by node Raft address) actually served the request if
 	// it wasn't served by this node.
 	ServedByHTTPHeader = "X-RQLITE-SERVED-BY"
+
+	// Resumable binary backup session headers.
+	BackupSessionHeader      = "X-RQLITE-BACKUP-SESSION"
+	BackupSessionSizeHeader  = "X-RQLITE-BACKUP-SIZE"
+	BackupSessionSumHeader   = "X-RQLITE-BACKUP-CHECKSUM"
+	BackupSessionIndexHeader = "X-RQLITE-BACKUP-RAFT-INDEX"
+
+	// backupSessionNew is the session selector value that creates a session.
+	backupSessionNew = "new"
 
 	// AllowOriginHeader is the HTTP header for allowing CORS compliant access from certain origins
 	AllowOriginHeader = "Access-Control-Allow-Origin"
@@ -661,6 +671,11 @@ func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request, qp QueryP
 		return
 	}
 
+	if qp.Session() != "" {
+		s.handleBackupSession(w, r, qp)
+		return
+	}
+
 	if r.Method != "GET" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -700,6 +715,212 @@ func (s *Service) handleBackup(w http.ResponseWriter, r *http.Request, qp QueryP
 	w.Header().Set(ServedByHTTPHeader, addr)
 
 	s.lastBackup = time.Now()
+}
+
+// handleBackupSession implements resumable binary backups backed by a pinned
+// server-side session. A session is created with "?session=new", its artifact
+// is read with "?session=<id>" (optionally a byte range), and it is released
+// with DELETE. Every response carries the session ID, the full artifact size,
+// its SHA-256 checksum and the Raft index of the database state it was taken
+// from, allowing a client to verify that every resumed fragment belongs to the
+// same backup.
+func (s *Service) handleBackupSession(w http.ResponseWriter, r *http.Request, qp QueryParams) {
+	creds := makeCredentials(r)
+	timeout := qp.Timeout(defaultTimeout)
+	noForward := qp.Redirect()
+	leaderOnly := !qp.NoLeader()
+
+	if qp.Session() == backupSessionNew {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		br := &proto.BackupRequest{
+			Format: qp.BackupFormat(),
+			Leader: leaderOnly,
+			Vacuum: qp.Vacuum(),
+			Tables: qp.Tables(),
+		}
+		info, addr, err := s.proxy.BackupSessionCreate(r.Context(), br, creds, timeout, noForward)
+		if err != nil {
+			s.writeBackupSessionErr(w, r, qp, err)
+			return
+		}
+		h := w.Header()
+		setBackupSessionHeaders(h, info)
+		h.Set("Accept-Ranges", "bytes")
+		h.Set(ServedByHTTPHeader, addr)
+		h.Set("Content-Length", "0")
+		w.WriteHeader(http.StatusCreated)
+		s.lastBackup = time.Now()
+		return
+	}
+
+	id := qp.Session()
+	switch r.Method {
+	case http.MethodGet:
+		// A Range header needs the artifact size to parse, so first prepare a
+		// whole-artifact metadata call -- this also confirms the session exists
+		// -- then parse the range and re-prepare the exact bounded range so the
+		// serving node validates it before any bytes are committed.
+		var offset, length int64
+		hasRange := r.Header.Get("Range") != ""
+		if hasRange {
+			offset, length = 0, -1
+		}
+
+		info, n, addr, err := s.proxy.BackupSessionPrepareRead(r.Context(), id, offset, length,
+			leaderOnly, creds, timeout, noForward)
+		if err != nil {
+			s.writeBackupSessionErr(w, r, qp, err)
+			return
+		}
+		if hasRange {
+			parsed, err := parseBackupRange(r.Header.Get("Range"), info.Size)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			// Re-prepare with the exact requested range so the cluster call to
+			// the leader also validates and reports the bounded byte count.
+			info, n, addr, err = s.proxy.BackupSessionPrepareRead(r.Context(), id,
+				parsed[0], parsed[1]-parsed[0]+1, leaderOnly, creds, timeout, noForward)
+			if err != nil {
+				s.writeBackupSessionErr(w, r, qp, err)
+				return
+			}
+			offset, length = parsed[0], parsed[1]-parsed[0]+1
+		}
+
+		if expected := normalizeChecksum(r.Header.Get("If-Match")); expected != "" && expected != info.Checksum {
+			http.Error(w, "backup session checksum mismatch", http.StatusConflict)
+			return
+		}
+
+		h := w.Header()
+		setBackupSessionHeaders(h, info)
+		h.Set("Accept-Ranges", "bytes")
+		h.Set("Content-Type", "application/octet-stream")
+		h.Set(ServedByHTTPHeader, addr)
+		status := http.StatusOK
+		if hasRange {
+			h.Set("Content-Range",
+				fmt.Sprintf("bytes %d-%d/%d", offset, offset+n-1, info.Size))
+			status = http.StatusPartialContent
+		}
+		h.Set("Content-Length", strconv.FormatInt(n, 10))
+		w.WriteHeader(status)
+
+		if _, _, readErr := s.proxy.BackupSessionRead(r.Context(), id, offset, length,
+			leaderOnly, w, creds, timeout, noForward); readErr != nil {
+			// The response status and headers are already committed; all that
+			// is left is to abort the body and log the failure.
+			s.logger.Printf("failed to stream backup session %s: %s", id, readErr.Error())
+			return
+		}
+
+	case http.MethodDelete:
+		addr, err := s.proxy.BackupSessionRelease(r.Context(), id, leaderOnly, creds, timeout, noForward)
+		if err != nil {
+			s.writeBackupSessionErr(w, r, qp, err)
+			return
+		}
+		w.Header().Set(ServedByHTTPHeader, addr)
+		w.WriteHeader(http.StatusNoContent)
+
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// writeBackupSessionErr maps backup session errors onto explicit HTTP status
+// codes. Unknown or expired sessions are rejected with 404, state/checksum
+// mismatches with 409 and invalid ranges with 416.
+func (s *Service) writeBackupSessionErr(w http.ResponseWriter, r *http.Request, qp QueryParams, err error) {
+	switch {
+	case errors.Is(err, proxy.ErrNotLeader) || strings.Contains(err.Error(), "not leader"):
+		s.DoRedirect(w, r, qp)
+	case errors.Is(err, proxy.ErrLeaderNotFound):
+		stats.Add(numLeaderNotFound, 1)
+		http.Error(w, proxy.ErrLeaderNotFound.Error(), http.StatusServiceUnavailable)
+	case errors.Is(err, proxy.ErrUnauthorized):
+		http.Error(w, "remote backup not authorized", http.StatusUnauthorized)
+	case errors.Is(err, store.ErrBackupSessionNotFound) ||
+		strings.Contains(err.Error(), store.ErrBackupSessionNotFound.Error()):
+		http.Error(w, "backup session not found or expired", http.StatusNotFound)
+	case errors.Is(err, store.ErrBackupSessionInvalidRange) ||
+		strings.Contains(err.Error(), store.ErrBackupSessionInvalidRange.Error()):
+		http.Error(w, err.Error(), http.StatusRequestedRangeNotSatisfiable)
+	case errors.Is(err, store.ErrBackupSessionLimit) ||
+		strings.Contains(err.Error(), store.ErrBackupSessionLimit.Error()):
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+	case errors.Is(err, store.ErrInvalidBackupFormat) ||
+		strings.Contains(err.Error(), store.ErrInvalidBackupFormat.Error()):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	default:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+// setBackupSessionHeaders writes the session metadata headers describing the
+// complete pinned artifact.
+func setBackupSessionHeaders(h http.Header, info *proto.BackupSessionInfo) {
+	h.Set(BackupSessionHeader, info.SessionId)
+	h.Set(BackupSessionSizeHeader, strconv.FormatInt(info.Size, 10))
+	h.Set(BackupSessionSumHeader, "sha256:"+info.Checksum)
+	h.Set(BackupSessionIndexHeader, strconv.FormatUint(info.RaftIndex, 10))
+}
+
+// parseBackupRange parses a single byte range and returns its inclusive
+// bounds. It supports "bytes=start-end", "bytes=start-" (to the end) and
+// "bytes=-suffix" (last suffix bytes).
+func parseBackupRange(spec string, size int64) ([2]int64, error) {
+	const prefix = "bytes="
+	if !strings.HasPrefix(spec, prefix) {
+		return [2]int64{}, fmt.Errorf("invalid or unsupported Range header: %s", spec)
+	}
+	spec = strings.TrimSpace(strings.TrimPrefix(spec, prefix))
+	if strings.Contains(spec, ",") {
+		return [2]int64{}, fmt.Errorf("multiple byte ranges are not supported: %s", spec)
+	}
+	startStr, endStr, found := strings.Cut(spec, "-")
+	if !found {
+		return [2]int64{}, fmt.Errorf("invalid Range header: %s", spec)
+	}
+
+	if startStr == "" {
+		// Suffix range: the last N bytes.
+		suffix, err := strconv.ParseInt(strings.TrimSpace(endStr), 10, 64)
+		if err != nil || suffix <= 0 {
+			return [2]int64{}, fmt.Errorf("invalid Range header: %s", spec)
+		}
+		if suffix > size {
+			suffix = size
+		}
+		return [2]int64{size - suffix, size - 1}, nil
+	}
+
+	start, err := strconv.ParseInt(strings.TrimSpace(startStr), 10, 64)
+	if err != nil || start < 0 || start >= size {
+		return [2]int64{}, fmt.Errorf("invalid Range header: %s", spec)
+	}
+	end := size - 1
+	if endStr = strings.TrimSpace(endStr); endStr != "" {
+		end, err = strconv.ParseInt(endStr, 10, 64)
+		if err != nil || end < start || end >= size {
+			return [2]int64{}, fmt.Errorf("invalid Range header: %s", spec)
+		}
+	}
+	return [2]int64{start, end}, nil
+}
+
+// normalizeChecksum strips the conventional quoting and "sha256:" prefix from
+// an If-Match value and returns the lowercase hex digest.
+func normalizeChecksum(v string) string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "sha256:")
+	v = strings.Trim(v, `"`)
+	return strings.TrimSpace(v)
 }
 
 // handleLoad loads the database from the given SQLite database file or SQLite dump.

@@ -692,6 +692,11 @@ type mockDatabase struct {
 	requestFn func(rr *command.ExecuteQueryRequest) ([]*command.ExecuteQueryResponse, uint64, uint64, error)
 	backupFn  func(br *command.BackupRequest, dst io.Writer) error
 	loadFn    func(lr *command.LoadRequest) error
+
+	backupSessionCreateFn      func(br *command.BackupRequest) (*command.BackupSessionInfo, error)
+	backupSessionPrepareReadFn func(id string, offset, length int64) (*command.BackupSessionInfo, int64, error)
+	backupSessionReadFn        func(id string, offset, length int64, dst io.Writer) (int64, error)
+	backupSessionReleaseFn     func(id string) error
 }
 
 func (m *mockDatabase) Execute(ctx context.Context, er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
@@ -722,6 +727,34 @@ func (m *mockDatabase) Load(ctx context.Context, lr *command.LoadRequest) error 
 		return nil
 	}
 	return m.loadFn(lr)
+}
+
+func (m *mockDatabase) BackupSessionCreate(ctx context.Context, br *command.BackupRequest) (*command.BackupSessionInfo, error) {
+	if m.backupSessionCreateFn == nil {
+		return nil, nil
+	}
+	return m.backupSessionCreateFn(br)
+}
+
+func (m *mockDatabase) BackupSessionPrepareRead(ctx context.Context, id string, offset, length int64) (*command.BackupSessionInfo, int64, error) {
+	if m.backupSessionPrepareReadFn == nil {
+		return nil, 0, nil
+	}
+	return m.backupSessionPrepareReadFn(id, offset, length)
+}
+
+func (m *mockDatabase) BackupSessionRead(ctx context.Context, id string, offset, length int64, dst io.Writer) (int64, error) {
+	if m.backupSessionReadFn == nil {
+		return 0, nil
+	}
+	return m.backupSessionReadFn(id, offset, length, dst)
+}
+
+func (m *mockDatabase) BackupSessionRelease(ctx context.Context, id string) error {
+	if m.backupSessionReleaseFn == nil {
+		return nil
+	}
+	return m.backupSessionReleaseFn(id)
 }
 
 func mustNewMockDatabase() *mockDatabase {

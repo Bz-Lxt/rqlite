@@ -358,6 +358,12 @@ type Store struct {
 	snapshotSync *rsync.SyncChannels
 	snapshotCAS  *rsync.CheckAndSet
 
+	// Resumable binary backup sessions pinning immutable backup artifacts.
+	backupSessions      map[string]*backupSession
+	backupSessionMu     sync.RWMutex
+	backupSessionStopCh chan struct{}
+	backupSessionDoneCh chan struct{}
+
 	// Latest log entry index actually reflected by the FSM. Due to Raft code
 	// these values are not updated automatically after a Snapshot-restore.
 	fsmIdx        atomic.Uint64
@@ -817,7 +823,8 @@ func (s *Store) Open() (retErr error) {
 	for _, pattern := range []string{
 		restoreScratchPattern,
 		bootScatchPattern,
-		backupScratchPattern} {
+		backupScratchPattern,
+		backupSessionScratchPattern} {
 		for _, dir := range []string{s.raftDir, s.dbDir} {
 			files, err := filepath.Glob(filepath.Join(dir, pattern))
 			if err != nil {
@@ -871,6 +878,8 @@ func (s *Store) Open() (retErr error) {
 	if err := s.initOptimizeTime(); err != nil {
 		return fmt.Errorf("failed to initialize auto-optimize times: %s", err.Error())
 	}
+
+	s.initBackupSessions()
 	return nil
 }
 
@@ -993,6 +1002,10 @@ func (s *Store) Close(wait bool) (retErr error) {
 		// Protect against closing already-closed resource, such as channels.
 		return nil
 	}
+
+	// Stop accepting and serving resumable backup sessions before Raft and
+	// SQLite are shut down.
+	s.closeBackupSessions()
 
 	if !s.NoSnapshotOnClose {
 		// Snapshot before closing to minimize startup time on next open.

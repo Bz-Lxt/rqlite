@@ -168,6 +168,17 @@ func (c *Client) Delete(u string, body io.Reader) (resp *http.Response, err erro
 	return c.doRequest(http.MethodDelete, up, body, nil)
 }
 
+// DoRequest sends a request with the given method, custom headers and optional
+// body to one of the hosts known to the client, applying the same host
+// failover, redirect and basic-auth behaviour as the other Client methods.
+func (c *Client) DoRequest(method, u string, body io.Reader, headers http.Header) (*http.Response, error) {
+	up, err := url.Parse(u)
+	if err != nil {
+		return nil, err
+	}
+	return c.doRequest(method, up, body, headers)
+}
+
 // Query sends GET requests to one of the hosts known to the client.
 func (c *Client) Query(url *url.URL) (*http.Response, error) {
 	return c.doRequest(http.MethodGet, url, nil, nil)

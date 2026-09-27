@@ -263,7 +263,7 @@ func main() {
 				if argErr != nil {
 					err = argErr
 				} else {
-					err = backup(ctx, client, arg)
+					err = backup(func(format string, args ...any) { ctx.String(format, args...) }, client, arg)
 				}
 			case ".RESTORE":
 				arg, argErr := requireArg(input, index, "please specify an input file to restore from")

@@ -112,6 +112,33 @@ message BackupRequest {
 	repeated string tables = 5;
 }
 
+message BackupSessionRequest {
+	enum Operation {
+		BACKUP_SESSION_OP_CREATE = 0;
+		BACKUP_SESSION_OP_READ = 1;
+		BACKUP_SESSION_OP_RELEASE = 2;
+		BACKUP_SESSION_OP_PREPARE_READ = 3;
+	}
+	Operation op = 1;
+	BackupRequest backup_request = 2;
+	string session_id = 3;
+	int64 offset = 4;
+	int64 length = 5;
+}
+
+message BackupSessionInfo {
+	string session_id = 1;
+	int64 size = 2;
+	string checksum = 3;
+	uint64 raft_index = 4;
+}
+
+message BackupSessionResponse {
+	string error = 1;
+	BackupSessionInfo info = 2;
+	int64 written = 3;
+}
+
 message LoadRequest {
 	bytes data = 1;
 }

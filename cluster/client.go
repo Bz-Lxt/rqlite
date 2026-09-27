@@ -344,6 +344,68 @@ func (c *Client) Backup(ctx context.Context, br *command.BackupRequest, nodeAddr
 	return err
 }
 
+// BackupSession performs a resumable-backup session operation (create, prepare
+// read, read, or release) against a remote node. For READ operations the
+// returned bytes are written to w, after the response header has been
+// processed, and the returned count equals the number of bytes written. If
+// creds is nil, then no credential information will be included in the request
+// to the remote node.
+func (c *Client) BackupSession(ctx context.Context, bsr *command.BackupSessionRequest, nodeAddr string,
+	creds *proto.Credentials, timeout time.Duration, w io.Writer) (*command.BackupSessionInfo, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
+	conn, err := c.dial(nodeAddr)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer conn.Close()
+
+	cmd := &proto.Command{
+		Type: proto.Command_COMMAND_TYPE_BACKUP_SESSION,
+		Request: &proto.Command_BackupSessionRequest{
+			BackupSessionRequest: bsr,
+		},
+		Credentials: creds,
+	}
+	if err := writeCommand(conn, cmd, timeout); err != nil {
+		handleConnError(conn)
+		return nil, 0, err
+	}
+
+	p, err := readResponse(conn, timeout)
+	if err != nil {
+		handleConnError(conn)
+		return nil, 0, err
+	}
+	resp := &proto.CommandBackupSessionResponse{}
+	if err := pb.Unmarshal(p, resp); err != nil {
+		handleConnError(conn)
+		return nil, 0, err
+	}
+	if resp.Error != "" {
+		// The serving node closes the connection after answering a READ, even
+		// when the read was rejected.
+		if bsr.Op == command.BackupSessionRequest_BACKUP_SESSION_OP_READ {
+			handleConnError(conn)
+		}
+		return nil, 0, errors.New(resp.Error)
+	}
+	if bsr.Op != command.BackupSessionRequest_BACKUP_SESSION_OP_READ {
+		return resp.Info, resp.Written, nil
+	}
+
+	// A read response header is followed by exactly Written raw bytes of the
+	// pinned artifact. The serving node closes the connection once the stream
+	// is done, so the pooled connection must not be handed out again.
+	if _, err := io.CopyN(w, conn, resp.Written); err != nil {
+		handleConnError(conn)
+		return nil, 0, err
+	}
+	handleConnError(conn)
+	return resp.Info, resp.Written, nil
+}
+
 // Load loads a SQLite file into the database. If creds is nil, then no
 // credential information will be included in the Load request to the remote node.
 func (c *Client) Load(ctx context.Context, lr *command.LoadRequest, nodeAddr string, creds *proto.Credentials, timeout time.Duration, retries int) error {

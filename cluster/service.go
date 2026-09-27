@@ -133,6 +133,23 @@ type Database interface {
 	// Backup writes a backup of the database to the writer.
 	Backup(ctx context.Context, br *command.BackupRequest, dst io.Writer) error
 
+	// BackupSessionCreate creates a resumable binary backup session and
+	// returns its metadata.
+	BackupSessionCreate(ctx context.Context, br *command.BackupRequest) (*command.BackupSessionInfo, error)
+
+	// BackupSessionPrepareRead validates a byte range of a backup session and
+	// returns the session metadata and the number of bytes a matching Read
+	// would write.
+	BackupSessionPrepareRead(ctx context.Context, id string, offset, length int64) (*command.BackupSessionInfo, int64, error)
+
+	// BackupSessionRead writes a previously validated byte range of a backup
+	// session to dst.
+	BackupSessionRead(ctx context.Context, id string, offset, length int64, dst io.Writer) (int64, error)
+
+	// BackupSessionRelease terminates a backup session and removes its pinned
+	// artifact.
+	BackupSessionRelease(ctx context.Context, id string) error
+
 	// Load an entire SQLite file into the database
 	Load(ctx context.Context, lr *command.LoadRequest) error
 }
@@ -544,6 +561,71 @@ func (s *Service) handleConn(conn net.Conn) {
 			br.Compress = true
 			if err := s.db.Backup(context.Background(), br, conn); err != nil {
 				s.logger.Printf("failed to stream backup: %s", err.Error())
+				return
+			}
+
+		case proto.Command_COMMAND_TYPE_BACKUP_SESSION:
+			stats.Add(numBackupRequest, 1)
+			resp := &proto.CommandBackupSessionResponse{}
+
+			bsr := c.GetBackupSessionRequest()
+			if bsr == nil {
+				resp.Error = "BackupSessionRequest is nil"
+			} else if !s.checkCommandPerm(c, auth.PermBackup) {
+				resp.Error = "unauthorized"
+			} else {
+				ctx := context.Background()
+				switch bsr.Op {
+				case command.BackupSessionRequest_BACKUP_SESSION_OP_CREATE:
+					info, err := s.db.BackupSessionCreate(ctx, bsr.BackupRequest)
+					if err != nil {
+						resp.Error = err.Error()
+					} else {
+						resp.Info = info
+					}
+
+				case command.BackupSessionRequest_BACKUP_SESSION_OP_PREPARE_READ:
+					info, n, err := s.db.BackupSessionPrepareRead(ctx, bsr.SessionId, bsr.Offset, bsr.Length)
+					if err != nil {
+						resp.Error = err.Error()
+					} else {
+						resp.Info = info
+						resp.Written = n
+					}
+
+				case command.BackupSessionRequest_BACKUP_SESSION_OP_READ:
+					info, n, err := s.db.BackupSessionPrepareRead(ctx, bsr.SessionId, bsr.Offset, bsr.Length)
+					if err != nil {
+						resp.Error = err.Error()
+					} else {
+						resp.Info = info
+						resp.Written = n
+					}
+					// Send the response header first so the client knows the
+					// session metadata and the exact number of bytes that follow,
+					// then stream the bounded range as raw bytes. READ always
+					// terminates the connection, whether or not the range read
+					// succeeds.
+					if err := marshalAndWrite(conn, resp); err != nil {
+						return
+					}
+					if resp.Error == "" {
+						if _, err := s.db.BackupSessionRead(ctx, bsr.SessionId, bsr.Offset, bsr.Length, conn); err != nil {
+							s.logger.Printf("failed to stream backup session: %s", err.Error())
+						}
+					}
+					return
+
+				case command.BackupSessionRequest_BACKUP_SESSION_OP_RELEASE:
+					if err := s.db.BackupSessionRelease(ctx, bsr.SessionId); err != nil {
+						resp.Error = err.Error()
+					}
+
+				default:
+					resp.Error = fmt.Sprintf("unknown backup session operation: %d", bsr.Op)
+				}
+			}
+			if err := marshalAndWrite(conn, resp); err != nil {
 				return
 			}
 

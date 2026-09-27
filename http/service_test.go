@@ -2591,6 +2591,11 @@ type MockStore struct {
 	stepdownFn  func(wait bool, id string) error
 	leaderAddr  string
 	notReady    bool // Default value is true, easier to test.
+
+	backupSessionCreateFn      func(br *command.BackupRequest) (*command.BackupSessionInfo, error)
+	backupSessionPrepareReadFn func(id string, offset, length int64) (*command.BackupSessionInfo, int64, error)
+	backupSessionReadFn        func(id string, offset, length int64, dst io.Writer) (int64, error)
+	backupSessionReleaseFn     func(id string) error
 }
 
 func (m *MockStore) Execute(ctx context.Context, er *command.ExecuteRequest) ([]*command.ExecuteQueryResponse, uint64, error) {
@@ -2701,15 +2706,44 @@ func (m *MockStore) LeaderAddr() (string, error) {
 	return m.leaderAddr, nil
 }
 
+func (m *MockStore) BackupSessionCreate(ctx context.Context, br *command.BackupRequest) (*command.BackupSessionInfo, error) {
+	if m.backupSessionCreateFn != nil {
+		return m.backupSessionCreateFn(br)
+	}
+	return nil, nil
+}
+
+func (m *MockStore) BackupSessionPrepareRead(ctx context.Context, id string, offset, length int64) (*command.BackupSessionInfo, int64, error) {
+	if m.backupSessionPrepareReadFn != nil {
+		return m.backupSessionPrepareReadFn(id, offset, length)
+	}
+	return nil, 0, nil
+}
+
+func (m *MockStore) BackupSessionRead(ctx context.Context, id string, offset, length int64, dst io.Writer) (int64, error) {
+	if m.backupSessionReadFn != nil {
+		return m.backupSessionReadFn(id, offset, length, dst)
+	}
+	return 0, nil
+}
+
+func (m *MockStore) BackupSessionRelease(ctx context.Context, id string) error {
+	if m.backupSessionReleaseFn != nil {
+		return m.backupSessionReleaseFn(id)
+	}
+	return nil
+}
+
 type mockClusterService struct {
-	apiAddr      string
-	executeFn    func(er *command.ExecuteRequest, addr string, t time.Duration) ([]*command.ExecuteQueryResponse, uint64, error)
-	queryFn      func(qr *command.QueryRequest, addr string, t time.Duration) ([]*command.QueryRows, uint64, error)
-	requestFn    func(eqr *command.ExecuteQueryRequest, nodeAddr string, timeout time.Duration) ([]*command.ExecuteQueryResponse, uint64, uint64, error)
-	backupFn     func(br *command.BackupRequest, addr string, t time.Duration, w io.Writer) error
-	loadFn       func(lr *command.LoadRequest, addr string, t time.Duration) error
-	removeNodeFn func(rn *command.RemoveNodeRequest, nodeAddr string, t time.Duration) error
-	stepdownFn   func(sr *command.StepdownRequest, nodeAddr string, t time.Duration) error
+	apiAddr         string
+	executeFn       func(er *command.ExecuteRequest, addr string, t time.Duration) ([]*command.ExecuteQueryResponse, uint64, error)
+	queryFn         func(qr *command.QueryRequest, addr string, t time.Duration) ([]*command.QueryRows, uint64, error)
+	requestFn       func(eqr *command.ExecuteQueryRequest, nodeAddr string, timeout time.Duration) ([]*command.ExecuteQueryResponse, uint64, uint64, error)
+	backupFn        func(br *command.BackupRequest, addr string, t time.Duration, w io.Writer) error
+	loadFn          func(lr *command.LoadRequest, addr string, t time.Duration) error
+	removeNodeFn    func(rn *command.RemoveNodeRequest, nodeAddr string, t time.Duration) error
+	stepdownFn      func(sr *command.StepdownRequest, nodeAddr string, t time.Duration) error
+	backupSessionFn func(bsr *command.BackupSessionRequest, addr string, t time.Duration, w io.Writer) (*command.BackupSessionInfo, int64, error)
 }
 
 func (m *mockClusterService) GetNodeMeta(ctx context.Context, a string, r int, t time.Duration) (*cluster.NodeMeta, error) {
@@ -2765,6 +2799,13 @@ func (m *mockClusterService) Stepdown(ctx context.Context, sr *command.StepdownR
 		return m.stepdownFn(sr, addr, t)
 	}
 	return nil
+}
+
+func (m *mockClusterService) BackupSession(ctx context.Context, bsr *command.BackupSessionRequest, addr string, creds *cluster.Credentials, t time.Duration, w io.Writer) (*command.BackupSessionInfo, int64, error) {
+	if m.backupSessionFn != nil {
+		return m.backupSessionFn(bsr, addr, t, w)
+	}
+	return nil, 0, nil
 }
 
 type mockCredentialStore struct {

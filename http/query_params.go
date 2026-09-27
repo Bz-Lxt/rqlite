@@ -144,6 +144,14 @@ func (qp QueryParams) Compress() bool {
 	return qp.HasKey("compress")
 }
 
+// Session returns the resumable backup session selector. The value "new"
+// requests creation of a new pinned backup session; any other non-empty value
+// identifies an existing session against which a ranged read or release is
+// performed. An empty string selects the legacy one-shot backup behaviour.
+func (qp QueryParams) Session() string {
+	return qp["session"]
+}
+
 // Key returns the value of the key named "key".
 func (qp QueryParams) Key() string {
 	return qp["key"]

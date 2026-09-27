@@ -74,6 +74,10 @@ type Store interface {
 	Request(ctx context.Context, eqr *proto.ExecuteQueryRequest) ([]*proto.ExecuteQueryResponse, uint64, uint64, error)
 	Load(ctx context.Context, lr *proto.LoadRequest) error
 	Backup(ctx context.Context, br *proto.BackupRequest, dst io.Writer) error
+	BackupSessionCreate(ctx context.Context, br *proto.BackupRequest) (*proto.BackupSessionInfo, error)
+	BackupSessionPrepareRead(ctx context.Context, id string, offset, length int64) (*proto.BackupSessionInfo, int64, error)
+	BackupSessionRead(ctx context.Context, id string, offset, length int64, dst io.Writer) (int64, error)
+	BackupSessionRelease(ctx context.Context, id string) error
 	Remove(ctx context.Context, rn *proto.RemoveNodeRequest) error
 	Stepdown(wait bool, id string) error
 	LeaderAddr() (string, error)
@@ -85,6 +89,7 @@ type Cluster interface {
 	Query(ctx context.Context, qr *proto.QueryRequest, nodeAddr string, creds *clstrPB.Credentials, timeout time.Duration, retries int) ([]*proto.QueryRows, uint64, error)
 	Request(ctx context.Context, eqr *proto.ExecuteQueryRequest, nodeAddr string, creds *clstrPB.Credentials, timeout time.Duration, retries int) ([]*proto.ExecuteQueryResponse, uint64, uint64, error)
 	Backup(ctx context.Context, br *proto.BackupRequest, nodeAddr string, creds *clstrPB.Credentials, timeout time.Duration, w io.Writer) error
+	BackupSession(ctx context.Context, bsr *proto.BackupSessionRequest, nodeAddr string, creds *clstrPB.Credentials, timeout time.Duration, w io.Writer) (*proto.BackupSessionInfo, int64, error)
 	Load(ctx context.Context, lr *proto.LoadRequest, nodeAddr string, creds *clstrPB.Credentials, timeout time.Duration, retries int) error
 	RemoveNode(ctx context.Context, rn *proto.RemoveNodeRequest, nodeAddr string, creds *clstrPB.Credentials, timeout time.Duration) error
 	Stepdown(ctx context.Context, sr *proto.StepdownRequest, nodeAddr string, creds *clstrPB.Credentials, timeout time.Duration) error
@@ -219,6 +224,120 @@ func (p *Proxy) Backup(ctx context.Context, br *proto.BackupRequest, dst io.Writ
 			return "", wrapIfUnauthorized(err)
 		}
 		stats.Add(numRemoteBackups, 1)
+		return addr, nil
+	}
+	return p.GetAPIAddr(), err
+}
+
+// BackupSessionCreate creates a resumable backup session. If the local store
+// returns ErrNotLeader and noForward is false, the request is forwarded to the
+// current leader.
+func (p *Proxy) BackupSessionCreate(ctx context.Context, br *proto.BackupRequest,
+	creds *clstrPB.Credentials, timeout time.Duration, noForward bool) (*proto.BackupSessionInfo, string, error) {
+	info, err := p.store.BackupSessionCreate(ctx, br)
+	if errors.Is(err, store.ErrNotLeader) {
+		if noForward {
+			return nil, "", ErrNotLeader
+		}
+		addr, addrErr := p.leaderAddr()
+		if addrErr != nil {
+			return nil, "", addrErr
+		}
+		bsr := &proto.BackupSessionRequest{
+			Op:            proto.BackupSessionRequest_BACKUP_SESSION_OP_CREATE,
+			BackupRequest: br,
+		}
+		info, _, err = p.cluster.BackupSession(ctx, bsr, addr, creds, timeout, nil)
+		if err != nil {
+			return nil, "", wrapIfUnauthorized(err)
+		}
+		stats.Add(numRemoteBackups, 1)
+		return info, addr, nil
+	}
+	return info, p.GetAPIAddr(), err
+}
+
+// BackupSessionPrepareRead validates a byte range of a backup session. When
+// leaderOnly is true (the default for leader-backed backups), a session which
+// is unknown to the local node is treated as "served by the leader" and, if
+// noForward is false, forwarded there.
+func (p *Proxy) BackupSessionPrepareRead(ctx context.Context, id string, offset, length int64,
+	leaderOnly bool, creds *clstrPB.Credentials, timeout time.Duration,
+	noForward bool) (*proto.BackupSessionInfo, int64, string, error) {
+	info, n, err := p.store.BackupSessionPrepareRead(ctx, id, offset, length)
+	if errors.Is(err, store.ErrNotLeader) || (leaderOnly && errors.Is(err, store.ErrBackupSessionNotFound)) {
+		if noForward {
+			return nil, 0, "", ErrNotLeader
+		}
+		addr, addrErr := p.leaderAddr()
+		if addrErr != nil {
+			return nil, 0, "", addrErr
+		}
+		bsr := &proto.BackupSessionRequest{
+			Op:        proto.BackupSessionRequest_BACKUP_SESSION_OP_PREPARE_READ,
+			SessionId: id,
+			Offset:    offset,
+			Length:    length,
+		}
+		info, n, err = p.cluster.BackupSession(ctx, bsr, addr, creds, timeout, nil)
+		if err != nil {
+			return nil, 0, "", wrapIfUnauthorized(err)
+		}
+		return info, n, addr, nil
+	}
+	return info, n, p.GetAPIAddr(), err
+}
+
+// BackupSessionRead streams a byte range of a backup session to dst. See
+// BackupSessionPrepareRead for the meaning of leaderOnly and forwarding.
+func (p *Proxy) BackupSessionRead(ctx context.Context, id string, offset, length int64,
+	leaderOnly bool, dst io.Writer, creds *clstrPB.Credentials, timeout time.Duration,
+	noForward bool) (int64, string, error) {
+	n, err := p.store.BackupSessionRead(ctx, id, offset, length, dst)
+	if errors.Is(err, store.ErrNotLeader) || (leaderOnly && errors.Is(err, store.ErrBackupSessionNotFound)) {
+		if noForward {
+			return 0, "", ErrNotLeader
+		}
+		addr, addrErr := p.leaderAddr()
+		if addrErr != nil {
+			return 0, "", addrErr
+		}
+		bsr := &proto.BackupSessionRequest{
+			Op:        proto.BackupSessionRequest_BACKUP_SESSION_OP_READ,
+			SessionId: id,
+			Offset:    offset,
+			Length:    length,
+		}
+		_, n, err = p.cluster.BackupSession(ctx, bsr, addr, creds, timeout, dst)
+		if err != nil {
+			return 0, "", wrapIfUnauthorized(err)
+		}
+		stats.Add(numRemoteBackups, 1)
+		return n, addr, nil
+	}
+	return n, p.GetAPIAddr(), err
+}
+
+// BackupSessionRelease releases a backup session. Leader-only sessions unknown
+// to the local node are forwarded to the leader when forwarding is enabled.
+func (p *Proxy) BackupSessionRelease(ctx context.Context, id string, leaderOnly bool,
+	creds *clstrPB.Credentials, timeout time.Duration, noForward bool) (string, error) {
+	err := p.store.BackupSessionRelease(ctx, id)
+	if errors.Is(err, store.ErrNotLeader) || (leaderOnly && errors.Is(err, store.ErrBackupSessionNotFound)) {
+		if noForward {
+			return "", ErrNotLeader
+		}
+		addr, addrErr := p.leaderAddr()
+		if addrErr != nil {
+			return "", addrErr
+		}
+		bsr := &proto.BackupSessionRequest{
+			Op:        proto.BackupSessionRequest_BACKUP_SESSION_OP_RELEASE,
+			SessionId: id,
+		}
+		if _, _, err := p.cluster.BackupSession(ctx, bsr, addr, creds, timeout, nil); err != nil {
+			return "", wrapIfUnauthorized(err)
+		}
 		return addr, nil
 	}
 	return p.GetAPIAddr(), err

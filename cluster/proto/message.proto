@@ -32,6 +32,7 @@ message Command {
         COMMAND_TYPE_BACKUP_STREAM = 11;
         COMMAND_TYPE_STEPDOWN = 12;
         COMMAND_TYPE_HIGHWATER_MARK_UPDATE = 13;
+        COMMAND_TYPE_BACKUP_SESSION = 14;
     }
     Type type = 1;
 
@@ -47,6 +48,7 @@ message Command {
         command.LoadChunkRequest load_chunk_request = 11;
         command.StepdownRequest stepdown_request = 12;
         HighwaterMarkUpdateRequest highwater_mark_update_request = 13;
+        command.BackupSessionRequest backup_session_request = 14;
     }
 
     Credentials credentials = 4;
@@ -74,6 +76,12 @@ message CommandRequestResponse {
 message CommandBackupResponse {
     string error = 1;
     bytes data = 2;
+}
+
+message CommandBackupSessionResponse {
+    string error = 1;
+    command.BackupSessionInfo info = 2;
+    int64 written = 3;
 }
 
 message CommandLoadResponse {
